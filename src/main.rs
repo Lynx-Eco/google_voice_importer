@@ -1,5 +1,5 @@
 use anyhow::{ Context, Result };
-use chrono::{ DateTime, NaiveDateTime, Utc };
+use chrono::{ DateTime, Utc };
 use clap::Parser;
 use indicatif::{ ProgressBar, ProgressStyle };
 use scraper::{ Html, Selector };
