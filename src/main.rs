@@ -1,26 +1,51 @@
-use std::fs::File;
-use std::io::{ self, BufRead };
-use std::path::{ Path, PathBuf };
-use chrono::NaiveDateTime;
-use clap::{ Parser, ValueEnum };
-use walkdir::WalkDir;
+use anyhow::{ Context, Result };
+use chrono::{ DateTime, NaiveDateTime, Utc };
+use clap::Parser;
+use indicatif::{ ProgressBar, ProgressStyle };
+use scraper::{ Html, Selector };
 use serde::Serialize;
+use std::collections::HashSet;
+use std::fs;
+use std::path::{ Path, PathBuf };
+use std::time::Instant;
+use walkdir::WalkDir;
 
+// Constants for HTML selectors and date format
+const MESSAGE_SELECTOR: &str = ".message";
+const DATETIME_SELECTOR: &str = ".dt";
+const SENDER_SELECTOR: &str = ".sender";
+const CONTENT_SELECTOR: &str = "q";
+const TAGS_SELECTOR: &str = ".tags";
+const TEXT_LABEL: &str = "- Text -";
+const GROUP_CONVERSATION_LABEL: &str = "Group Conversation -";
+const DATETIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3f%:z";
+
+// Struct to represent a participant in the conversation
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
+struct Participant {
+    name: String,
+    phone: String,
+}
+
+// Struct to represent a single message
 #[derive(Debug, Clone, Serialize)]
 struct Message {
-    from: String,
-    to: String,
-    timestamp: NaiveDateTime,
+    from: Participant,
+    to: Vec<Participant>,
+    timestamp: DateTime<Utc>,
     content: String,
 }
 
+// Struct to represent a thread of messages
 #[derive(Debug, Serialize)]
 struct Thread {
     messages: Vec<Message>,
+    participants: Vec<Participant>,
     labels: Vec<String>,
     message_count: usize,
 }
 
+// Command-line interface struct
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
 struct Cli {
@@ -28,118 +53,260 @@ struct Cli {
     input: PathBuf,
 
     /// Output format
-    #[clap(value_enum, default_value_t = OutputFormat::Debug)]
+    #[clap(value_enum, default_value_t = OutputFormat::Default)]
     format: OutputFormat,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Serialize)]
+// Enum to represent different output formats
+#[derive(clap::ValueEnum, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 enum OutputFormat {
     Debug,
     Json,
+    Default,
 }
 
-fn main() -> io::Result<()> {
+// Struct to hold statistics about the processing run
+#[derive(Debug)]
+struct RunStatistics {
+    duration: std::time::Duration,
+    files_processed: usize,
+    messages_extracted: usize,
+    unique_participants: usize,
+    avg_messages_per_file: f64,
+}
+
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.input.is_dir() {
-        for entry in WalkDir::new(&cli.input)
-            .into_iter()
-            .filter_map(|e| e.ok()) {
-            if entry.file_type().is_file() {
-                process_file(entry.path(), &cli.format)?;
+        process_directory(&cli.input, &cli.format)
+    } else {
+        process_file(&cli.input, &cli.format)
+    }
+}
+
+fn process_directory(dir: &Path, format: &OutputFormat) -> Result<()> {
+    let start_time = Instant::now();
+    let mut files_processed = 0;
+    let mut total_messages = 0;
+    let mut all_participants = HashSet::new();
+
+    // Get the list of files to process
+    let files: Vec<_> = WalkDir::new(dir)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_type().is_file() &&
+                (e.file_name().to_str().unwrap_or("").contains(TEXT_LABEL) ||
+                    e.file_name().to_str().unwrap_or("").contains(GROUP_CONVERSATION_LABEL))
+        })
+        .collect();
+
+    // Set up progress bar for Default format
+    let progress_bar = if *format == OutputFormat::Default {
+        let pb = ProgressBar::new(files.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})"
+                )
+                .unwrap()
+                .progress_chars("#>-")
+        );
+        Some(pb)
+    } else {
+        None
+    };
+
+    // Process each file
+    for entry in files {
+        let thread = parse_file(entry.path()).context("Failed to parse file")?;
+        match format {
+            OutputFormat::Debug => println!("{:#?}", thread),
+            OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&thread)?),
+            OutputFormat::Default => {
+                if let Some(pb) = &progress_bar {
+                    pb.inc(1);
+                }
             }
         }
-    } else {
-        process_file(&cli.input, &cli.format)?;
+
+        files_processed += 1;
+        total_messages += thread.messages.len();
+        all_participants.extend(thread.participants.iter().cloned());
+    }
+
+    // Finalize progress bar
+    if let Some(pb) = progress_bar {
+        pb.finish_with_message("Processing complete");
+    }
+
+    // Calculate and display statistics for Default format
+    if *format == OutputFormat::Default {
+        let duration = start_time.elapsed();
+        let stats = RunStatistics {
+            duration,
+            files_processed,
+            messages_extracted: total_messages,
+            unique_participants: all_participants.len(),
+            avg_messages_per_file: (total_messages as f64) / (files_processed as f64),
+        };
+        print_statistics(&stats);
     }
 
     Ok(())
 }
 
-fn process_file(file_path: &Path, format: &OutputFormat) -> io::Result<()> {
+fn process_file(file_path: &Path, format: &OutputFormat) -> Result<()> {
     println!("Processing file: {:?}", file_path);
-    let thread = parse_file(file_path)?;
+    let thread = parse_file(file_path).context("Failed to parse file")?;
 
     match format {
         OutputFormat::Debug => println!("{:#?}", thread),
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&thread).unwrap()),
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&thread)?),
+        OutputFormat::Default => {
+            println!("Processed 1 file with {} messages", thread.messages.len());
+        }
     }
 
     Ok(())
 }
 
-fn parse_file<P: AsRef<Path>>(filename: P) -> io::Result<Thread> {
-    let file = File::open(filename)?;
-    let reader = io::BufReader::new(file);
-    let mut messages = Vec::new();
-    let mut labels = Vec::new();
-    let mut current_message: Option<Message> = None;
+fn parse_file(filename: &Path) -> Result<Thread> {
+    let content = fs::read_to_string(filename).context("Failed to read file")?;
+    let document = Html::parse_document(&content);
 
-    for line in reader.lines() {
-        let line = line?;
-        if line.starts_with("Labels:") {
-            labels = line
+    // Initialize selectors
+    let message_selector = Selector::parse(MESSAGE_SELECTOR).unwrap();
+    let dt_selector = Selector::parse(DATETIME_SELECTOR).unwrap();
+    let sender_selector = Selector::parse(SENDER_SELECTOR).unwrap();
+    let q_selector = Selector::parse(CONTENT_SELECTOR).unwrap();
+
+    let mut participants = HashSet::new();
+    let mut me_participant = None;
+
+    // First pass: Collect all participants
+    for message_element in document.select(&message_selector) {
+        let sender_element = message_element.select(&sender_selector).next().unwrap();
+        let phone_number = sender_element
+            .select(&Selector::parse("a.tel").unwrap())
+            .next()
+            .and_then(|el| el.value().attr("href"))
+            .and_then(|href| href.strip_prefix("tel:"))
+            .unwrap_or("Unknown");
+
+        let name = sender_element
+            .select(&Selector::parse("span.fn, abbr.fn").unwrap())
+            .next()
+            .and_then(|el| el.text().next())
+            .unwrap_or("");
+
+        let participant = Participant {
+            name: name.to_string(),
+            phone: phone_number.to_string(),
+        };
+
+        if name == "Me" {
+            me_participant = Some(participant.clone());
+        }
+
+        participants.insert(participant);
+    }
+
+    let participants: Vec<Participant> = participants.into_iter().collect();
+    let me_participant = me_participant.unwrap_or_else(|| {
+        Participant {
+            name: "Me".to_string(),
+            phone: "Unknown".to_string(),
+        }
+    });
+
+    // Second pass: Parse messages
+    let messages = document
+        .select(&message_selector)
+        .map(|message_element| {
+            let timestamp = message_element
+                .select(&dt_selector)
+                .next()
+                .and_then(|el| el.value().attr("title"))
+                .and_then(|date_str| DateTime::parse_from_str(date_str, DATETIME_FORMAT).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).expect("Invalid timestamp"));
+
+            let sender_element = message_element.select(&sender_selector).next().unwrap();
+            let phone_number = sender_element
+                .select(&Selector::parse("a.tel").unwrap())
+                .next()
+                .and_then(|el| el.value().attr("href"))
+                .and_then(|href| href.strip_prefix("tel:"))
+                .unwrap_or("Unknown");
+
+            let from = participants
+                .iter()
+                .find(|p| p.phone == phone_number)
+                .unwrap_or(&me_participant)
+                .clone();
+
+            let to = if from == me_participant {
+                participants
+                    .iter()
+                    .filter(|&p| p != &me_participant)
+                    .cloned()
+                    .collect()
+            } else {
+                vec![me_participant.clone()]
+            };
+
+            let content = message_element
+                .select(&q_selector)
+                .next()
+                .map(|el| el.text().collect::<String>())
+                .unwrap_or_default();
+
+            Message {
+                from,
+                to,
+                timestamp,
+                content,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let labels = parse_labels(&document);
+
+    Ok(Thread {
+        messages: messages.clone(),
+        participants,
+        labels,
+        message_count: messages.len(),
+    })
+}
+
+fn parse_labels(document: &Html) -> Vec<String> {
+    let tags_selector = Selector::parse(TAGS_SELECTOR).unwrap();
+    document
+        .select(&tags_selector)
+        .next()
+        .map(|tags_element| {
+            tags_element
+                .text()
+                .collect::<String>()
                 .split(':')
                 .nth(1)
                 .unwrap_or("")
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .collect();
-            continue;
-        }
-        if line.starts_with("User Deleted:") {
-            // Skip this line
-            continue;
-        }
-
-        if let Some(date_time) = line.split(": ").next() {
-            if let Ok(timestamp) = parse_flexible_datetime(date_time) {
-                if let Some(message) = current_message.take() {
-                    messages.push(message);
-                }
-
-                let parts: Vec<&str> = line.splitn(3, ": ").collect();
-                if parts.len() == 3 {
-                    current_message = Some(Message {
-                        from: parts[1].to_string(),
-                        to: "Unknown".to_string(),
-                        timestamp,
-                        content: parts[2].to_string(),
-                    });
-                }
-            } else if let Some(ref mut message) = current_message {
-                message.content.push('\n');
-                message.content.push_str(&line);
-            }
-        } else if let Some(ref mut message) = current_message {
-            message.content.push('\n');
-            message.content.push_str(&line);
-        }
-    }
-
-    if let Some(message) = current_message {
-        messages.push(message);
-    }
-    Ok(Thread {
-        messages: messages.clone(),
-        labels,
-        message_count: messages.len(),
-    })
+                .collect()
+        })
+        .unwrap_or_default()
 }
-fn parse_flexible_datetime(date_time: &str) -> Result<NaiveDateTime, anyhow::Error> {
-    let formats = [
-        "%b %d, %Y, %I:%M:%S %p Pacific Time",
-        "%b %d, %Y, %I:%M:%S %p %Z",
-        "%b %d, %Y, %I:%M:%S %p",
-        "%Y-%m-%d %H:%M:%S %Z",
-        "%Y-%m-%d %H:%M:%S",
-    ];
 
-    for format in &formats {
-        if let Ok(dt) = NaiveDateTime::parse_from_str(date_time, format) {
-            return Ok(dt);
-        }
-    }
-    Err(anyhow::anyhow!("Failed to parse datetime: {}", date_time))
+fn print_statistics(stats: &RunStatistics) {
+    println!("\nRun Statistics:");
+    println!("Duration: {:?}", stats.duration);
+    println!("Files processed: {}", stats.files_processed);
+    println!("Messages extracted: {}", stats.messages_extracted);
+    println!("Unique participants: {}", stats.unique_participants);
+    println!("Average messages per file: {:.2}", stats.avg_messages_per_file);
 }
