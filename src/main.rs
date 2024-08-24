@@ -1,6 +1,7 @@
 use anyhow::{ Context, Result };
 use chrono::{ DateTime, Utc };
 use clap::Parser;
+use cypher_writer::neo4j_writer;
 use indicatif::{ ProgressBar, ProgressStyle };
 use scraper::{ Html, Selector };
 use serde::Serialize;
@@ -10,7 +11,10 @@ use std::path::{ Path, PathBuf };
 use std::time::Instant;
 use walkdir::WalkDir;
 use glob::glob;
-
+use tokio::sync::mpsc;
+mod cypher_writer;
+use std::thread;
+use log::{ info, warn, error };
 // Constants for HTML selectors and date format
 
 const MESSAGE_SELECTOR: &str = ".message";
@@ -22,6 +26,13 @@ const TEXT_LABEL: &str = "- Text -";
 const GROUP_CONVERSATION_LABEL: &str = "Group Conversation -";
 const DATETIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3f%:z";
 const FILE_TYPE: &str = "html";
+
+// Knowledge gragh constants
+const NEO4J_URI: &str = "bolt://localhost:7687";
+const NEO4J_USER: &str = "neo4j";
+const NEO4J_PASSWORD: &str = "password";
+const THREAD_BATCH_SIZE: usize = 100;
+
 // Struct to represent a participant in the conversation
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 struct Participant {
@@ -65,6 +76,7 @@ enum OutputFormat {
     Debug,
     Json,
     Default,
+    Cypher,
 }
 
 // Struct to hold statistics about the processing run
@@ -78,6 +90,8 @@ struct RunStatistics {
 }
 
 fn main() -> Result<()> {
+    env_logger::init();
+    info!("Starting...");
     let cli = Cli::parse();
 
     // Expand the input path, including any glob patterns
@@ -87,6 +101,7 @@ fn main() -> Result<()> {
         .collect();
 
     if expanded_paths.is_empty() {
+        error!("No matching paths found for: {:?}", cli.input);
         anyhow::bail!("No matching paths found for: {:?}", cli.input);
     }
 
@@ -140,9 +155,39 @@ fn process_directory(dir: &Path, format: &OutputFormat) -> Result<()> {
         None
     };
 
+    // Create a channel for Neo4j writing if needed
+    let channel = if *format == OutputFormat::Cypher {
+        Some(tokio::sync::mpsc::channel(100))
+    } else {
+        None
+    };
+
+    let (tx, rx) = match channel {
+        Some((tx, rx)) => (Some(tx), Some(rx)),
+        None => (None, None),
+    };
+    // Spawn Neo4j writer thread if Cypher format is selected
+    let neo4j_handle = if let Some(rx) = rx {
+        Some(
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    if let Err(e) = neo4j_writer(rx).await {
+                        eprintln!("Error in Neo4j writer: {:?}", e);
+                    }
+                });
+            })
+        )
+    } else {
+        None
+    };
+
     // Process each file
     for entry in files {
         let thread = parse_file(entry.path()).context("Failed to parse file")?;
+        files_processed += 1;
+        total_messages += thread.messages.len();
+        all_participants.extend(thread.participants.iter().cloned());
         match format {
             OutputFormat::Debug => println!("{:#?}", thread),
             OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&thread)?),
@@ -151,18 +196,26 @@ fn process_directory(dir: &Path, format: &OutputFormat) -> Result<()> {
                     pb.inc(1);
                 }
             }
+            OutputFormat::Cypher => {
+                if let Some(tx) = &tx {
+                    // Use blocking send for synchronous context
+                    tx.blocking_send(thread).context("Failed to send thread to Neo4j writer")?;
+                }
+            }
         }
-
-        files_processed += 1;
-        total_messages += thread.messages.len();
-        all_participants.extend(thread.participants.iter().cloned());
     }
 
     // Finalize progress bar
     if let Some(pb) = progress_bar {
         pb.finish_with_message("Processing complete");
     }
+    // Drop the sender to signal the receiver that we're done
+    drop(tx);
 
+    // Wait for the Neo4j writer to finish if it was started
+    if let Some(handle) = neo4j_handle {
+        handle.join().map_err(|e| anyhow::anyhow!("Failed to join Neo4j writer thread: {:?}", e))?;
+    }
     // Calculate and display statistics for Default format
     if *format == OutputFormat::Default {
         let duration = start_time.elapsed();
@@ -182,12 +235,45 @@ fn process_directory(dir: &Path, format: &OutputFormat) -> Result<()> {
 fn process_file(file_path: &Path, format: &OutputFormat) -> Result<()> {
     println!("Processing file: {:?}", file_path);
     let thread = parse_file(file_path).context("Failed to parse file")?;
+    // Create a channel for Neo4j writing if needed
 
+    // Create a channel for Neo4j writing if needed
+    let channel = if *format == OutputFormat::Cypher {
+        Some(tokio::sync::mpsc::channel(100))
+    } else {
+        None
+    };
+
+    let (tx, rx) = match channel {
+        Some((tx, rx)) => (Some(tx), Some(rx)),
+        None => (None, None),
+    };
+    // Spawn Neo4j writer thread if Cypher format is selected
+    let neo4j_handle = if let Some(rx) = rx {
+        Some(
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(async {
+                    if let Err(e) = neo4j_writer(rx).await {
+                        eprintln!("Error in Neo4j writer: {:?}", e);
+                    }
+                });
+            })
+        )
+    } else {
+        None
+    };
     match format {
         OutputFormat::Debug => println!("{:#?}", thread),
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&thread)?),
         OutputFormat::Default => {
             println!("Processed 1 file with {} messages", thread.messages.len());
+        }
+        OutputFormat::Cypher => {
+            if let Some(tx) = &tx {
+                // Use blocking send for synchronous context
+                tx.blocking_send(thread).context("Failed to send thread to Neo4j writer")?;
+            }
         }
     }
 
