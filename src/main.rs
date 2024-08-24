@@ -21,7 +21,7 @@ const TAGS_SELECTOR: &str = ".tags";
 const TEXT_LABEL: &str = "- Text -";
 const GROUP_CONVERSATION_LABEL: &str = "Group Conversation -";
 const DATETIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3f%:z";
-
+const FILE_TYPE: &str = "html";
 // Struct to represent a participant in the conversation
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 struct Participant {
@@ -115,6 +115,10 @@ fn process_directory(dir: &Path, format: &OutputFormat) -> Result<()> {
         .filter_map(Result::ok)
         .filter(|e| {
             e.file_type().is_file() &&
+                e
+                    .path()
+                    .extension()
+                    .map_or(false, |ext| ext == FILE_TYPE) &&
                 (e.file_name().to_str().unwrap_or("").contains(TEXT_LABEL) ||
                     e.file_name().to_str().unwrap_or("").contains(GROUP_CONVERSATION_LABEL))
         })
