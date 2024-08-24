@@ -9,8 +9,10 @@ use std::fs;
 use std::path::{ Path, PathBuf };
 use std::time::Instant;
 use walkdir::WalkDir;
+use glob::glob;
 
 // Constants for HTML selectors and date format
+
 const MESSAGE_SELECTOR: &str = ".message";
 const DATETIME_SELECTOR: &str = ".dt";
 const SENDER_SELECTOR: &str = ".sender";
@@ -78,11 +80,27 @@ struct RunStatistics {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if cli.input.is_dir() {
-        process_directory(&cli.input, &cli.format)
-    } else {
-        process_file(&cli.input, &cli.format)
+    // Expand the input path, including any glob patterns
+    let expanded_paths: Vec<PathBuf> = glob(&cli.input.to_string_lossy())
+        .with_context(|| format!("Failed to read glob pattern: {:?}", cli.input))?
+        .filter_map(Result::ok)
+        .collect();
+
+    if expanded_paths.is_empty() {
+        anyhow::bail!("No matching paths found for: {:?}", cli.input);
     }
+
+    for path in expanded_paths {
+        if path.is_dir() {
+            process_directory(&path, &cli.format)?;
+        } else if path.is_file() {
+            process_file(&path, &cli.format)?;
+        } else {
+            println!("Skipping non-file, non-directory: {:?}", path);
+        }
+    }
+
+    Ok(())
 }
 
 fn process_directory(dir: &Path, format: &OutputFormat) -> Result<()> {
